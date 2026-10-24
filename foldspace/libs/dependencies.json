@@ -1,0 +1,36 @@
+[
+  {
+    "file": "api-13.1.5.jar",
+    "sha256": "4315FCD853F487321548BE5A997749FE43105FA29AAAA6F6E7A8CDC958A38357",
+    "source": "https://repo.maven.apache.org/maven2/dev/rikka/shizuku/api/13.1.5/api-13.1.5.aar",
+    "archiveSha256": "4DEF9BDE498EF8626614C2FC5DB9AF4749C86F16F6C33E3F5658D35E70BAB59B",
+    "license": "MIT"
+  },
+  {
+    "file": "provider-13.1.5.jar",
+    "sha256": "35AEE86B938CB8D06B315C9D73C30F41EC7CFDC10009A5DE83733BC5C4DB5051",
+    "source": "https://repo.maven.apache.org/maven2/dev/rikka/shizuku/provider/13.1.5/provider-13.1.5.aar",
+    "archiveSha256": "B0F18CD9812464EC171C53CAC93A819FE411718A3965C311F01EB4DE265381B3",
+    "license": "MIT"
+  },
+  {
+    "file": "aidl-13.1.5.jar",
+    "sha256": "584945C98F21B0C4E3CCDB74B51528F89852174C30BB2A4786C43A8CA456E496",
+    "source": "https://repo.maven.apache.org/maven2/dev/rikka/shizuku/aidl/13.1.5/aidl-13.1.5.aar",
+    "archiveSha256": "33FE7191CDD69FCB66D649264F3B0C47ACB2F3D6343AFC05B98DBBFF6F221963",
+    "license": "MIT"
+  },
+  {
+    "file": "shared-13.1.5.jar",
+    "sha256": "8557B8C715D374F8DA18E148CA5B971D1C7435E91447E6D4F7664403C7328760",
+    "source": "https://repo.maven.apache.org/maven2/dev/rikka/shizuku/shared/13.1.5/shared-13.1.5.aar",
+    "archiveSha256": "4659642C9339BE0A26E9C65BB8648F7AD6D8F4A465F557993CCBC78802381635",
+    "license": "MIT"
+  },
+  {
+    "file": "annotation-1.3.0.jar",
+    "sha256": "97DC45AFEFE3A1E421DA42B8B6E9F90491477C45FC6178203E3A5E8A05EE8553",
+    "source": "https://dl.google.com/dl/android/maven2/androidx/annotation/annotation/1.3.0/annotation-1.3.0.jar",
+    "license": "Apache-2.0"
+  }
+]

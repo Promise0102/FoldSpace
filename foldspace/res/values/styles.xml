@@ -1,0 +1,13 @@
+<resources>
+    <style name="SpaceTheme" parent="android:style/Theme.Material.NoActionBar">
+        <item name="android:fontFamily">sans</item>
+        <item name="android:colorAccent">#AAC4FF</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowLightNavigationBar">false</item>
+        <item name="android:statusBarColor">#17223B</item>
+        <item name="android:navigationBarColor">#101A30</item>
+        <item name="android:windowActionModeOverlay">true</item>
+        <item name="android:windowFullscreen">true</item>
+        <item name="android:windowBackground">#17223B</item>
+    </style>
+</resources>
