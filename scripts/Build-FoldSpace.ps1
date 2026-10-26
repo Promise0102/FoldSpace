@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [string]$Version = '0.3.1',
+    [string]$Version = '0.6.3',
     [string]$BuildToolsVersion = '36.0.0',
     [string]$AndroidPlatform,
     [string]$OutputDirectory
@@ -15,6 +15,10 @@ $dependencyRecords = Get-Content -LiteralPath (Join-Path $projectRoot 'foldspace
 foreach ($dependency in $dependencyRecords) {
     $actual = (Get-FileHash -LiteralPath (Join-Path $projectRoot ('foldspace\libs\' + $dependency.file)) -Algorithm SHA256).Hash
     if ($actual -ne $dependency.sha256) { throw ('Dependency hash mismatch: ' + $dependency.file) }
+}
+$glassSource=Get-Content -LiteralPath (Join-Path $projectRoot 'foldspace/libs/liquid-glass-source.json') -Raw | ConvertFrom-Json
+foreach($entry in @(@{path=$glassSource.sourcePath;hash=$glassSource.sha256},@{path=$glassSource.licensePath;hash=$glassSource.licenseSha256})) {
+    if((Get-FileHash -LiteralPath (Join-Path $projectRoot $entry.path) -Algorithm SHA256).Hash -ne $entry.hash){throw 'Liquid glass source or license hash mismatch.'}
 }
 $sdkPath = Resolve-FoldSpaceAndroidSdk
 $buildTools = Join-Path $sdkPath ('build-tools/' + $BuildToolsVersion)
@@ -62,9 +66,10 @@ try {
         package='com.mkf.foldspace'; version=$manifestVersion
         versionCode=$sourceManifest.manifest.GetAttribute('versionCode','http://schemas.android.com/apk/res/android')
         sha256=(Get-FileHash -LiteralPath $outputPath -Algorithm SHA256).Hash
-        source='foldspace native project'; requires='User-authorized running Shizuku for upper-screen app hosting'
+        source='foldspace native project'; requires='User-authorized running Shizuku for video/game dual-region hosting'
         deviceValidation='Not performed by this build script; fullscreen UI and upper-host interactions require device validation.'
         dependencies=$dependencyRecords
+        liquidGlassSource=$glassSource
     } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath ($outputPath + '.build.json') -Encoding utf8
     Write-Output "Native project build complete: $outputPath"
     Write-Output "Build staging directory retained: $stagePath"

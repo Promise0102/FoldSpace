@@ -1,0 +1,11 @@
+{
+  "repository": "https://github.com/QmDeve/AndroidLiquidGlassView",
+  "commit": "d4238c557e46271f29ec0e3d3ee211bcf58dc2e0",
+  "license": "MIT",
+  "upstreamPath": "core/src/main/res/raw/liquidglass_effect.agsl",
+  "sourcePath": "foldspace/res/raw/liquidglass_effect.agsl",
+  "sha256": "31cbbf3e7c2b41d1700f0cc1ddcd8a752f5030053d9e9c994c6837f1a91798ea",
+  "licensePath": "foldspace/libs/AndroidLiquidGlassView-MIT-LICENSE.txt",
+  "licenseSha256": "4527d21980efb05e76ed908601d9063193d701ec4da6d6ede0f07567dfe4c6ff",
+  "integration": "Unmodified upstream AGSL shader; native RenderNode adapter and liquid press controls maintained in FoldSpace."
+}

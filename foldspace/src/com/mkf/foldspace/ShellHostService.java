@@ -22,18 +22,20 @@ public final class ShellHostService extends Binder {
     private final Handler worker;
     private final Context shellContext;
     private final int ownerUid;
-    private VirtualDisplay display;
-    private int width,height;
-    private String targetPackage="";
-    private int restoreTaskId=-1,restoreDisplayId=0;
-    private String transfer="",continuity="";
+    private final BackgroundTaskRestorer backgroundReturn;
+    private static final class Session {
+        VirtualDisplay display;int width,height,restoreTaskId=-1,restoreDisplayId=0;
+        String targetPackage="",transfer="",continuity="";
+        AccessibilityNodeInfo seekNode;Rect seekBounds;long nextTreeQuery;
+        IBinder owner;IBinder.DeathRecipient death;boolean video;
+    }
+    private final SessionRegistry<Session> sessions=new SessionRegistry<>();
+    private Session active;
+
     private UiAutomation automation;
     private boolean automationAttempted;
     private Method inject, setDisplayId;
     private Object inputManager;
-    private AccessibilityNodeInfo seekNode;
-    private Rect seekBounds;
-    private long nextTreeQuery;
     // Without DESTROY_CONTENT_ON_REMOVAL: system moves remaining tasks home instead of finishing them.
     // PUBLIC | PRESENTATION | OWN_CONTENT | TOUCH | TRUSTED | OWN_FOCUS | NO_FOCUS_STEAL
     private final int trustedFlags=1|2|8|64|1024|16384|65536;
@@ -45,11 +47,11 @@ public final class ShellHostService extends Binder {
         Context system=(Context)threadClass.getMethod("getSystemContext").invoke(thread);
         shellContext=system.createPackageContext("com.android.shell",Context.CONTEXT_IGNORE_SECURITY);
         ownerUid=shellContext.getPackageManager().getApplicationInfo("com.mkf.foldspace",0).uid;
-        workerThread.start();automationEvents.start();worker=new Handler(workerThread.getLooper());
+        backgroundReturn=new BackgroundTaskRestorer(shellContext);workerThread.start();automationEvents.start();worker=new Handler(workerThread.getLooper());worker.post(LegacyRotationRecovery::restore);
     }
     public ShellHostService(Context ignored) throws Exception { this(); }
     @Override protected boolean onTransact(int code,Parcel data,Parcel reply,int flags) throws RemoteException {
-        if(code==16777115){int uid=Binder.getCallingUid();if(uid!=ownerUid && uid!=2000 && uid!=0)throw new SecurityException("Not owner");worker.post(()->{release();System.exit(0);});if(reply!=null)reply.writeNoException();return true;}
+        if(code==16777115){int uid=Binder.getCallingUid();if(uid!=ownerUid && uid!=2000 && uid!=0)throw new SecurityException("Not owner");worker.post(()->{for(Session session:sessions.values()){active=session;release();}System.exit(0);});if(reply!=null)reply.writeNoException();return true;}
         if(code<1 || code>9)return super.onTransact(code,data,reply,flags);
         if(Binder.getCallingUid()!=ownerUid)throw new SecurityException("Only FoldSpace may control this display");
         data.enforceInterface(HostProtocol.TOKEN);
@@ -57,21 +59,29 @@ public final class ShellHostService extends Binder {
         try {
             if(code==HostProtocol.CURRENT_APP){String current=run(()->foreground().toString());reply.writeNoException();reply.writeString(current);
             }else if(code==HostProtocol.CREATE){
-                Surface surface=Surface.CREATOR.createFromParcel(data);int w=data.readInt(),h=data.readInt(),dpi=data.readInt();
+                Surface surface=Surface.CREATOR.createFromParcel(data);int w=data.readInt(),h=data.readInt(),dpi=data.readInt(),slot=data.readInt();IBinder owner=data.readStrongBinder();
                 int id;
-                try{id=run(()->{release();width=checked(w,160,4096);height=checked(h,120,4096);int density=checked(dpi,120,640);
-                    display=shellContext.getSystemService(DisplayManager.class).createVirtualDisplay("FoldSpace upper app",width,height,density,surface,trustedFlags,null,worker);
-                    if(display==null)throw new IllegalStateException("Display creation returned null");configureDisplay(display.getDisplay().getDisplayId());return display.getDisplay().getDisplayId();});}
-                finally{surface.release();}reply.writeNoException();reply.writeInt(id);
+                try{id=run(()->{
+                    SessionRegistry.check(slot);int width=checked(w,160,4096),height=checked(h,120,4096),density=checked(dpi,120,640);
+                    if(owner==null || !owner.isBinderAlive())throw new IllegalArgumentException("Live display owner required");
+                    Session previous=sessions.at(slot);if(previous!=null){active=previous;release();}
+                    Session next=new Session();next.width=width;next.height=height;next.owner=owner;
+                    next.display=shellContext.getSystemService(DisplayManager.class).createVirtualDisplay("FoldSpace "+(slot==0?"video":"game"),width,height,density,surface,trustedFlags,null,worker);
+                    if(next.display==null)throw new IllegalStateException("Display creation returned null");
+                    int displayId=next.display.getDisplay().getDisplayId();active=next;sessions.put(slot,displayId,next);
+                    next.death=()->worker.post(()->{if(sessions.get(displayId)==next){active=next;release();}});
+                    try{owner.linkToDeath(next.death,0);configureDisplay(displayId);return displayId;}
+                    catch(Exception error){release();throw error;}
+                });}finally{surface.release();}reply.writeNoException();reply.writeInt(id);
             }else if(code==HostProtocol.LAUNCH){
                 Intent intent=Intent.CREATOR.createFromParcel(data);
-                int taskId=data.readInt(),sourceDisplay=data.readInt();
-                String result=runHost(session,()->launch(intent,taskId,sourceDisplay));reply.writeNoException();reply.writeString(result);
+                int taskId=data.readInt(),sourceDisplay=data.readInt();boolean video=data.readInt()!=0;
+                String result=runHost(session,()->{active.video=video;return launch(intent,taskId,sourceDisplay);});reply.writeNoException();reply.writeString(result);
             }else if(code==HostProtocol.TOUCH){
                 MotionEvent event=MotionEvent.CREATOR.createFromParcel(data);
                 boolean ok;try{ok=runHost(session,()->input(event));}finally{event.recycle();}reply.writeNoException();reply.writeInt(ok?1:0);
-            }else if(code==HostProtocol.RESIZE){int w=data.readInt(),h=data.readInt(),dpi=data.readInt();runHost(session,()->{width=checked(w,160,4096);height=checked(h,120,4096);display.resize(width,height,checked(dpi,120,640));return null;});reply.writeNoException();
-            }else if(code==HostProtocol.RELEASE){String result=run(()->{if(display!=null && display.getDisplay().getDisplayId()==session)release();return transfer+"; "+continuity;});reply.writeNoException();reply.writeString(result);
+            }else if(code==HostProtocol.RESIZE){int w=data.readInt(),h=data.readInt(),dpi=data.readInt();runHost(session,()->{active.width=checked(w,160,4096);active.height=checked(h,120,4096);active.display.resize(active.width,active.height,checked(dpi,120,640));return null;});reply.writeNoException();
+            }else if(code==HostProtocol.RELEASE){String result=run(()->{Session ended=sessions.get(session);if(ended==null)return "session already ended";active=ended;release();return ended.transfer+"; "+ended.continuity;});reply.writeNoException();reply.writeString(result);
             }else if(code==HostProtocol.STATUS){String state=runHost(session,()->status().toString());reply.writeNoException();reply.writeString(state);
             }else if(code==HostProtocol.SEEK){float fraction=data.readFloat();float[] line=data.createFloatArray();boolean ok=runHost(session,()->seek(fraction,line));reply.writeNoException();reply.writeInt(ok?1:0);
             }else if(code==HostProtocol.KEY){int key=data.readInt();if(key!=KeyEvent.KEYCODE_BACK)throw new SecurityException("Unsupported key");runHost(session,()->{long t=SystemClock.uptimeMillis();KeyEvent down=new KeyEvent(t,t,KeyEvent.ACTION_DOWN,key,0);KeyEvent up=new KeyEvent(t,t,KeyEvent.ACTION_UP,key,0);injectEvent(down);injectEvent(up);return null;});reply.writeNoException();}
@@ -79,7 +89,7 @@ public final class ShellHostService extends Binder {
         return true;
     }
     private <T>T run(Callable<T> task)throws Exception{FutureTask<T> future=new FutureTask<>(task);worker.post(future);return future.get(12,TimeUnit.SECONDS);}
-    private <T>T runHost(int session,Callable<T> task)throws Exception{return run(()->{if(display==null || display.getDisplay().getDisplayId()!=session)throw new IllegalStateException("This upper-screen session has ended");return task.call();});}
+    private <T>T runHost(int session,Callable<T> task)throws Exception{return run(()->{active=sessions.get(session);if(active==null || active.display==null)throw new IllegalStateException("This display session has ended");return task.call();});}
     private static int checked(int value,int min,int max){if(value<min || value>max)throw new IllegalArgumentException("Display geometry outside supported bounds");return value;}
     private void configureDisplay(int id){
         // Changes apply only to our temporary display, never to the phone's physical display.
@@ -88,7 +98,7 @@ public final class ShellHostService extends Binder {
             catch(Exception e){Log.w("FoldSpaceHost","Temporary display configuration unavailable",e);}
         }
     }
-    private java.util.List<android.app.ActivityManager.RunningTaskInfo> tasks(){return shellContext.getSystemService(android.app.ActivityManager.class).getRunningTasks(40);}
+    private java.util.List<android.app.ActivityManager.RunningTaskInfo> tasks(){return shellContext.getSystemService(android.app.ActivityManager.class).getRunningTasks(100);}
     private int displayOf(android.app.ActivityManager.RunningTaskInfo task){try{return task.getClass().getField("displayId").getInt(task);}catch(ReflectiveOperationException e){throw new IllegalStateException("Task display metadata unavailable",e);}}
     private android.app.ActivityManager.RunningTaskInfo task(int id){for(android.app.ActivityManager.RunningTaskInfo task:tasks())if(task.taskId==id)return task;return null;}
     private JSONObject foreground()throws Exception{
@@ -105,6 +115,7 @@ public final class ShellHostService extends Binder {
         return new JSONObject();
     }
     private boolean moveTask(int taskId,int destination){
+        if(destination==Display.DEFAULT_DISPLAY)throw new IllegalArgumentException("Foreground task transfer is only for hosting");
         try{
             java.lang.Process process=new ProcessBuilder("/system/bin/am","display","move-stack",String.valueOf(taskId),String.valueOf(destination)).redirectErrorStream(true).start();
             if(!process.waitFor(2,TimeUnit.SECONDS)){process.destroy();return false;}
@@ -113,7 +124,7 @@ public final class ShellHostService extends Binder {
         }catch(Exception e){Log.w("FoldSpaceHost","Task transfer unavailable",e);}return false;
     }
     private String launch(Intent launch,int existingTaskId,int sourceDisplay)throws Exception{
-        if(display==null)throw new IllegalStateException("Create display first");
+        if(active.display==null)throw new IllegalStateException("Create display first");
         ComponentName component=launch.getComponent();if(component==null)throw new IllegalArgumentException("Explicit launcher required");
         Intent check=new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER).setComponent(component);
         boolean launcher=false;
@@ -121,27 +132,30 @@ public final class ShellHostService extends Binder {
             if(info.activityInfo.exported && component.getPackageName().equals(info.activityInfo.packageName) && component.getClassName().equals(info.activityInfo.name)){launcher=true;break;}
         }
         if(!launcher)throw new IllegalArgumentException("Not an installed launcher activity");
-        targetPackage=component.getPackageName();clearSeek();nextTreeQuery=0;
+        for(Session other:sessions.values())if(other!=active && component.getPackageName().equals(other.targetPackage))throw new IllegalStateException("该应用已在另一个分区运行，请选择其他应用");
+        active.targetPackage=component.getPackageName();clearSeek();active.nextTreeQuery=0;
         android.app.ActivityManager.RunningTaskInfo current=existingTaskId>=0?task(existingTaskId):null;
         if(existingTaskId<0)for(android.app.ActivityManager.RunningTaskInfo candidate:tasks()){
-            if(displayOf(candidate)==Display.DEFAULT_DISPLAY && candidate.topActivity!=null && targetPackage.equals(candidate.topActivity.getPackageName())){current=candidate;break;}
+            if(displayOf(candidate)==Display.DEFAULT_DISPLAY && candidate.topActivity!=null && active.targetPackage.equals(candidate.topActivity.getPackageName())){current=candidate;break;}
         }
-        if(current!=null && displayOf(current)==Display.DEFAULT_DISPLAY && current.topActivity!=null && targetPackage.equals(current.topActivity.getPackageName())){
+        if(current!=null && displayOf(current)==Display.DEFAULT_DISPLAY && current.topActivity!=null && active.targetPackage.equals(current.topActivity.getPackageName())){
             PlaybackCheckpoint checkpoint=capturePlayback(Display.DEFAULT_DISPLAY,current.taskId);
-            if(moveTask(current.taskId,display.getDisplay().getDisplayId())){
-                restoreTaskId=current.taskId;restoreDisplayId=Display.DEFAULT_DISPLAY;transfer="adopted task="+current.taskId;
-                restorePlayback(checkpoint,display.getDisplay().getDisplayId());return transfer;
+            if(moveTask(current.taskId,active.display.getDisplay().getDisplayId())){
+                active.restoreTaskId=current.taskId;active.restoreDisplayId=Display.DEFAULT_DISPLAY;active.transfer="adopted task="+current.taskId;
+                restorePlayback(checkpoint,active.display.getDisplay().getDisplayId());return active.transfer;
             }
             throw new IllegalStateException("无法移动现有应用任务，已保留原页面，请退出后重试");
         }
         if(existingTaskId>=0)throw new IllegalStateException("原应用任务已变化，已取消承接以避免重新打开视频");
         // Argument array: user-supplied labels/URLs are never interpreted by a shell.
-        java.lang.Process process=new ProcessBuilder("/system/bin/am","start","--display",String.valueOf(display.getDisplay().getDisplayId()),"--windowingMode","1","-a",Intent.ACTION_MAIN,"-c",Intent.CATEGORY_LAUNCHER,"-n",component.flattenToString(),"-f","0x10000000").redirectErrorStream(true).start();
-        java.io.ByteArrayOutputStream output=new java.io.ByteArrayOutputStream();byte[] buffer=new byte[2048];int read;while((read=process.getInputStream().read(buffer))!=-1)output.write(buffer,0,read);
+        java.lang.Process process=new ProcessBuilder("/system/bin/am","start","--display",String.valueOf(active.display.getDisplay().getDisplayId()),"--windowingMode","1","-a",Intent.ACTION_MAIN,"-c",Intent.CATEGORY_LAUNCHER,"-n",component.flattenToString(),"-f","0x10000000").redirectErrorStream(true).start();
+        if(!process.waitFor(5,TimeUnit.SECONDS)){process.destroy();throw new IllegalStateException("应用启动超时，请在目录中重试");}
+        java.io.ByteArrayOutputStream output=new java.io.ByteArrayOutputStream();byte[] buffer=new byte[2048];int read;
+        try(java.io.InputStream stream=process.getInputStream()){while((read=stream.read(buffer))!=-1){output.write(buffer,0,read);if(output.size()>16384)throw new IllegalStateException("Unexpected launch response");}}
         String result=output.toString("UTF-8");if(process.waitFor()!=0 || result.contains("Error:"))throw new IllegalStateException(result);
-        for(android.app.ActivityManager.RunningTaskInfo hosted:tasks())if(displayOf(hosted)==display.getDisplay().getDisplayId() && hosted.topActivity!=null && targetPackage.equals(hosted.topActivity.getPackageName())){restoreTaskId=hosted.taskId;restoreDisplayId=Display.DEFAULT_DISPLAY;break;}
-        transfer="started task="+restoreTaskId;
-        Log.i("FoldSpaceHost","launched "+targetPackage+" on display "+display.getDisplay().getDisplayId());return result;
+        for(android.app.ActivityManager.RunningTaskInfo hosted:tasks())if(displayOf(hosted)==active.display.getDisplay().getDisplayId() && hosted.topActivity!=null && active.targetPackage.equals(hosted.topActivity.getPackageName())){active.restoreTaskId=hosted.taskId;active.restoreDisplayId=Display.DEFAULT_DISPLAY;break;}
+        active.transfer="started task="+active.restoreTaskId;
+        Log.i("FoldSpaceHost","launched "+active.targetPackage+" on display "+active.display.getDisplay().getDisplayId());return result;
     }
     private void initInput()throws Exception{
         if(inputManager!=null)return;
@@ -149,11 +163,11 @@ public final class ShellHostService extends Binder {
         inputManager=clazz.getMethod("getInstance").invoke(null);inject=clazz.getMethod("injectInputEvent",InputEvent.class,int.class);
         setDisplayId=InputEvent.class.getMethod("setDisplayId",int.class);
     }
-    private boolean injectEvent(InputEvent event)throws Exception{if(display==null)return false;return injectAt(event,display.getDisplay().getDisplayId());}
+    private boolean injectEvent(InputEvent event)throws Exception{if(active.display==null)return false;return injectAt(event,active.display.getDisplay().getDisplayId());}
     private boolean injectAt(InputEvent event,int destination)throws Exception{initInput();setDisplayId.invoke(event,destination);return (Boolean)inject.invoke(inputManager,event,0);}
-    private boolean input(MotionEvent event)throws Exception{if(display==null)return false;event.setSource(InputDevice.SOURCE_TOUCHSCREEN);return injectEvent(event);}
+    private boolean input(MotionEvent event)throws Exception{if(active.display==null)return false;event.setSource(InputDevice.SOURCE_TOUCHSCREEN);return injectEvent(event);}
     private MediaController controller(){
-        try{for(MediaController c:shellContext.getSystemService(MediaSessionManager.class).getActiveSessions(null))if(c.getPackageName().equals(targetPackage))return c;}catch(RuntimeException ignored){}
+        try{for(MediaController c:shellContext.getSystemService(MediaSessionManager.class).getActiveSessions(null))if(c.getPackageName().equals(active.targetPackage))return c;}catch(RuntimeException ignored){}
         return null;
     }
     private void initAutomation(){
@@ -168,8 +182,8 @@ public final class ShellHostService extends Binder {
         }catch(Exception e){automation=null;Log.w("FoldSpaceHost","Native progress discovery unavailable",e);}
     }
     private void querySeek(){
-        if(display==null || SystemClock.uptimeMillis()<nextTreeQuery)return;nextTreeQuery=SystemClock.uptimeMillis()+2000;
-        querySeek(display.getDisplay().getDisplayId());
+        if(active.display==null || SystemClock.uptimeMillis()<active.nextTreeQuery)return;active.nextTreeQuery=SystemClock.uptimeMillis()+2000;
+        querySeek(active.display.getDisplay().getDisplayId());
     }
     private void querySeek(int destination){
         clearSeek();initAutomation();if(automation==null)return;
@@ -184,49 +198,50 @@ public final class ShellHostService extends Binder {
                 if(++inspected>700){node.recycle();while(!queue.isEmpty())queue.removeFirst().recycle();break;}
                 CharSequence pkg=node.getPackageName();String cls=String.valueOf(node.getClassName());Rect bounds=new Rect();node.getBoundsInScreen(bounds);
                 AccessibilityNodeInfo.RangeInfo range=node.getRangeInfo();
-                if(targetPackage.contentEquals(pkg==null?"":pkg) && node.isVisibleToUser() && (cls.contains("SeekBar") || range!=null) && bounds.width()>queryWidth*.25f && bounds.height()<queryHeight*.28f && bounds.centerY()>queryHeight*.3f){
-                    if(seekNode!=null)seekNode.recycle();seekNode=AccessibilityNodeInfo.obtain(node);seekBounds=new Rect(bounds);
+                if(active.targetPackage.contentEquals(pkg==null?"":pkg) && node.isVisibleToUser() && (cls.contains("SeekBar") || range!=null) && bounds.width()>queryWidth*.25f && bounds.height()<queryHeight*.28f && bounds.centerY()>queryHeight*.3f){
+                    if(active.seekNode!=null)active.seekNode.recycle();active.seekNode=AccessibilityNodeInfo.obtain(node);active.seekBounds=new Rect(bounds);
                 }
                 for(int i=0;i<node.getChildCount();i++){AccessibilityNodeInfo child=node.getChild(i);if(child!=null)queue.add(child);}node.recycle();
             }
         }
     }
     private JSONObject status()throws Exception{
-        JSONObject obj=new JSONObject();obj.put("displayId",display==null?-1:display.getDisplay().getDisplayId());obj.put("package",targetPackage);
-        obj.put("transfer",transfer);obj.put("continuity",continuity);
+        JSONObject obj=new JSONObject();obj.put("displayId",active.display==null?-1:active.display.getDisplay().getDisplayId());obj.put("package",active.targetPackage);
+        obj.put("transfer",active.transfer);obj.put("continuity",active.continuity);
         MediaController c=controller();boolean mediaSeek=false;
         if(c!=null){PlaybackState s=c.getPlaybackState();MediaMetadata m=c.getMetadata();long duration=m==null?0:m.getLong(MediaMetadata.METADATA_KEY_DURATION);
             if(s!=null && duration>0){mediaSeek=(s.getActions()&PlaybackState.ACTION_SEEK_TO)!=0;long position=s.getPosition();if(s.getState()==PlaybackState.STATE_PLAYING)position+=(long)((SystemClock.elapsedRealtime()-s.getLastPositionUpdateTime())*s.getPlaybackSpeed());
                 obj.put("duration",duration);obj.put("position",Math.max(0,Math.min(duration,position)));obj.put("playing",s.getState()==PlaybackState.STATE_PLAYING);}}
-        if(!mediaSeek){try{querySeek();}catch(RuntimeException e){clearSeek();Log.w("FoldSpaceHost","Native seek discovery failed",e);}}obj.put("mode",mediaSeek?"media":seekBounds!=null?"native":"none");
-        if(seekNode!=null){AccessibilityNodeInfo.RangeInfo range=seekNode.getRangeInfo();if(range!=null && range.getMax()>range.getMin())obj.put("fraction",(range.getCurrent()-range.getMin())/(range.getMax()-range.getMin()));}
+        if(!mediaSeek){try{querySeek();}catch(RuntimeException e){clearSeek();Log.w("FoldSpaceHost","Native seek discovery failed",e);}}obj.put("mode",mediaSeek?"media":active.seekBounds!=null?"native":"none");
+        if(active.seekNode!=null){AccessibilityNodeInfo.RangeInfo range=active.seekNode.getRangeInfo();if(range!=null && range.getMax()>range.getMin())obj.put("fraction",(range.getCurrent()-range.getMin())/(range.getMax()-range.getMin()));}
         return obj;
     }
     private boolean seek(float fraction,float[] line)throws Exception{
-        if(display==null || Float.isNaN(fraction))return false;fraction=Math.max(0,Math.min(1,fraction));
+        if(active.display==null || Float.isNaN(fraction))return false;fraction=Math.max(0,Math.min(1,fraction));
         MediaController c=controller();if(c!=null){PlaybackState s=c.getPlaybackState();MediaMetadata m=c.getMetadata();long duration=m==null?0:m.getLong(MediaMetadata.METADATA_KEY_DURATION);if(s!=null && duration>0 && (s.getActions()&PlaybackState.ACTION_SEEK_TO)!=0){c.getTransportControls().seekTo((long)(fraction*duration));return true;}}
         querySeek();
-        if(line==null && seekNode!=null){AccessibilityNodeInfo.RangeInfo range=seekNode.getRangeInfo();if(range!=null){Bundle args=new Bundle();args.putFloat(AccessibilityNodeInfo.ACTION_ARGUMENT_PROGRESS_VALUE,range.getMin()+fraction*(range.getMax()-range.getMin()));if(seekNode.performAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_SET_PROGRESS.getId(),args))return true;}}
-        if(line==null && seekBounds!=null)line=new float[]{seekBounds.left/(float)width,seekBounds.centerY()/(float)height,seekBounds.right/(float)width,seekBounds.centerY()/(float)height};
-        float[] point=ControlGeometry.point(fraction,line,width,height);if(point==null)return false;float x=point[0],y=point[1];
+        if(line==null && active.seekNode!=null){AccessibilityNodeInfo.RangeInfo range=active.seekNode.getRangeInfo();if(range!=null){Bundle args=new Bundle();args.putFloat(AccessibilityNodeInfo.ACTION_ARGUMENT_PROGRESS_VALUE,range.getMin()+fraction*(range.getMax()-range.getMin()));if(active.seekNode.performAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_SET_PROGRESS.getId(),args))return true;}}
+        if(line==null && active.seekBounds!=null)line=new float[]{active.seekBounds.left/(float)active.width,active.seekBounds.centerY()/(float)active.height,active.seekBounds.right/(float)active.width,active.seekBounds.centerY()/(float)active.height};
+        float[] point=ControlGeometry.point(fraction,line,active.width,active.height);if(point==null)return false;float x=point[0],y=point[1];
         long down=SystemClock.uptimeMillis();MotionEvent e=MotionEvent.obtain(down,down,MotionEvent.ACTION_DOWN,x,y,0);input(e);e.recycle();SystemClock.sleep(50);
-        e=MotionEvent.obtain(down,SystemClock.uptimeMillis(),MotionEvent.ACTION_MOVE,Math.min(width-1,x+1),y,0);input(e);e.recycle();SystemClock.sleep(30);
+        e=MotionEvent.obtain(down,SystemClock.uptimeMillis(),MotionEvent.ACTION_MOVE,Math.min(active.width-1,x+1),y,0);input(e);e.recycle();SystemClock.sleep(30);
         e=MotionEvent.obtain(down,SystemClock.uptimeMillis(),MotionEvent.ACTION_UP,x,y,0);input(e);e.recycle();return true;
     }
-    private void clearSeek(){if(seekNode!=null){seekNode.recycle();seekNode=null;}seekBounds=null;}
+    private void clearSeek(){if(active.seekNode!=null){active.seekNode.recycle();active.seekNode=null;}active.seekBounds=null;}
     private static final class PlaybackCheckpoint{
         final int taskId;long position,duration;String mediaId="";float fraction=Float.NaN,min,max;
         PlaybackCheckpoint(int taskId){this.taskId=taskId;}
         boolean available(){return duration>0 || !Float.isNaN(fraction);}
     }
     private PlaybackCheckpoint capturePlayback(int source,int taskId){
-        PlaybackCheckpoint saved=new PlaybackCheckpoint(taskId);continuity="unavailable";
+        PlaybackCheckpoint saved=new PlaybackCheckpoint(taskId);active.continuity="unavailable";
+        if(!active.video){active.continuity="not-video";return saved;}
         try{
             MediaController c=controller();if(c!=null){PlaybackState s=c.getPlaybackState();MediaMetadata m=c.getMetadata();
                 if(s!=null && m!=null && (s.getActions()&PlaybackState.ACTION_SEEK_TO)!=0){saved.duration=m.getLong(MediaMetadata.METADATA_KEY_DURATION);saved.position=s.getPosition();saved.mediaId=String.valueOf(m.getString(MediaMetadata.METADATA_KEY_MEDIA_ID));}}
-            if(saved.duration<=0){querySeek(source);if(seekNode!=null){AccessibilityNodeInfo.RangeInfo r=seekNode.getRangeInfo();
+            if(saved.duration<=0){querySeek(source);if(active.seekNode!=null){AccessibilityNodeInfo.RangeInfo r=active.seekNode.getRangeInfo();
                 if(r!=null && r.getMax()>r.getMin()){saved.min=r.getMin();saved.max=r.getMax();saved.fraction=(r.getCurrent()-r.getMin())/(r.getMax()-r.getMin());}}}
-            if(saved.available())continuity="captured";
+            if(saved.available())active.continuity="captured";
         }catch(Exception e){Log.w("FoldSpaceHost","Playback checkpoint unavailable",e);}return saved;
     }
     private void restorePlayback(PlaybackCheckpoint saved,int destination){
@@ -236,36 +251,50 @@ public final class ShellHostService extends Binder {
         do{SystemClock.sleep(300);
             try{
                 android.app.ActivityManager.RunningTaskInfo current=task(saved.taskId);
-                if(current==null || displayOf(current)!=destination || current.topActivity==null || !targetPackage.equals(current.topActivity.getPackageName())){continuity="task changed";return;}
+                if(current==null || displayOf(current)!=destination || current.topActivity==null || !active.targetPackage.equals(current.topActivity.getPackageName())){active.continuity="task changed";return;}
                 if(saved.duration>0){MediaController c=controller();if(c==null)continue;MediaMetadata m=c.getMetadata();PlaybackState s=c.getPlaybackState();
                     if(m==null || s==null || (s.getActions()&PlaybackState.ACTION_SEEK_TO)==0)continue;
-                    if(saved.duration!=m.getLong(MediaMetadata.METADATA_KEY_DURATION) || !saved.mediaId.equals(String.valueOf(m.getString(MediaMetadata.METADATA_KEY_MEDIA_ID)))){continuity="media changed";return;}
-                    if(s.getPosition()+1200<saved.position){c.getTransportControls().seekTo(saved.position);continuity="media position restored";return;}
-                    if(SystemClock.uptimeMillis()-started<1000)continue;continuity="media position retained";return;
+                    if(saved.duration!=m.getLong(MediaMetadata.METADATA_KEY_DURATION) || !saved.mediaId.equals(String.valueOf(m.getString(MediaMetadata.METADATA_KEY_MEDIA_ID)))){active.continuity="media changed";return;}
+                    if(s.getPosition()+1200<saved.position){c.getTransportControls().seekTo(saved.position);active.continuity="media position restored";return;}
+                    if(SystemClock.uptimeMillis()-started<1000)continue;active.continuity="media position retained";return;
                 }
-                querySeek(destination);if(seekNode==null)continue;AccessibilityNodeInfo.RangeInfo range=seekNode.getRangeInfo();
+                querySeek(destination);if(active.seekNode==null)continue;AccessibilityNodeInfo.RangeInfo range=active.seekNode.getRangeInfo();
                 if(range==null || range.getMax()!=saved.max || range.getMin()!=saved.min)continue;
                 float after=(range.getCurrent()-range.getMin())/(range.getMax()-range.getMin());
-                if(!PlaybackContinuity.needsRestore(saved.fraction,after)){if(SystemClock.uptimeMillis()-started<1000)continue;continuity=(attempts>0?"native position restored":"native position retained")+" before="+saved.fraction+" after="+after;return;}
+                if(!PlaybackContinuity.needsRestore(saved.fraction,after)){if(SystemClock.uptimeMillis()-started<1000)continue;active.continuity=(attempts>0?"native position restored":"native position retained")+" before="+saved.fraction+" after="+after;return;}
                 Bundle args=new Bundle();args.putFloat(AccessibilityNodeInfo.ACTION_ARGUMENT_PROGRESS_VALUE,saved.min+saved.fraction*(saved.max-saved.min));
-                boolean supported=attempts++==0 && seekNode.performAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_SET_PROGRESS.getId(),args);
-                if(!supported && seekBounds!=null){
-                    float x=seekBounds.left+saved.fraction*seekBounds.width(),y=seekBounds.centerY();long t=SystemClock.uptimeMillis();
+                boolean supported=attempts++==0 && active.seekNode.performAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_SET_PROGRESS.getId(),args);
+                if(!supported && active.seekBounds!=null){
+                    float x=active.seekBounds.left+saved.fraction*active.seekBounds.width(),y=active.seekBounds.centerY();long t=SystemClock.uptimeMillis();
                     for(int action:new int[]{MotionEvent.ACTION_DOWN,MotionEvent.ACTION_MOVE,MotionEvent.ACTION_UP}){
                         MotionEvent event=MotionEvent.obtain(t,SystemClock.uptimeMillis(),action,x,y,0);event.setSource(InputDevice.SOURCE_TOUCHSCREEN);
                         try{supported=injectAt(event,destination);}finally{event.recycle();}SystemClock.sleep(40);
                     }
                 }
-                continuity=supported?"native position restored (checking)":"native restore unsupported";
+                active.continuity=supported?"native position restored (checking)":"native restore unsupported";
             }catch(Exception e){Log.w("FoldSpaceHost","Playback restore unavailable",e);}
         }while(SystemClock.uptimeMillis()<deadline);
-        if(continuity.endsWith("(checking)"))continuity="native restore not confirmed";
+        if(active.continuity.endsWith("(checking)"))active.continuity="native restore not confirmed";
     }
     private void release(){
-        if(display!=null && restoreTaskId>=0){android.app.ActivityManager.RunningTaskInfo current=task(restoreTaskId);if(current!=null && displayOf(current)==display.getDisplay().getDisplayId()){
-            PlaybackCheckpoint checkpoint=capturePlayback(display.getDisplay().getDisplayId(),restoreTaskId);
-            boolean restored=moveTask(restoreTaskId,restoreDisplayId);transfer="restored task="+restoreTaskId+" success="+restored;if(restored)restorePlayback(checkpoint,restoreDisplayId);
-            Log.i("FoldSpaceHost","restored task="+restoreTaskId+" success="+restored);}}
-        restoreTaskId=-1;clearSeek();targetPackage="";if(display!=null){display.release();display=null;}if(automation!=null){try{UiAutomation.class.getMethod("disconnect").invoke(automation);}catch(Exception ignored){}automation=null;}automationAttempted=false;
+        if(active==null)return;
+        ArrayList<Integer> fallback=new ArrayList<>();int destination=active.restoreDisplayId,returned=0;
+        try{
+            if(active.display!=null){int ownedDisplay=active.display.getDisplay().getDisplayId();
+                for(android.app.ActivityManager.RunningTaskInfo hosted:tasks())if(displayOf(hosted)==ownedDisplay){
+                    if(backgroundReturn.restore(hosted,destination))returned++;else fallback.add(hosted.taskId);
+                }
+            }
+            active.transfer="background return count="+returned+" fallback="+fallback.size();
+            // Returning apps to the background must not inject progress touches into display 0.
+            active.continuity="background return; playback restore skipped";
+        }catch(RuntimeException error){active.transfer="background return unavailable";Log.w("FoldSpaceHost","Task background return failed",error);}
+        finally{
+            active.restoreTaskId=-1;clearSeek();active.targetPackage="";
+            if(active.owner!=null && active.death!=null)try{active.owner.unlinkToDeath(active.death,0);}catch(RuntimeException ignored){}
+            if(active.display!=null){sessions.remove(active.display.getDisplay().getDisplayId());try{active.display.release();}finally{active.display=null;}}
+            for(int taskId:fallback){boolean lowered=backgroundReturn.lowerAfterDisplayRemoval(taskId,destination);active.transfer+="; lower task="+taskId+" success="+lowered;}
+            if(sessions.isEmpty()){if(automation!=null){try{UiAutomation.class.getMethod("disconnect").invoke(automation);}catch(Exception ignored){}automation=null;}automationAttempted=false;}
+        }
     }
 }

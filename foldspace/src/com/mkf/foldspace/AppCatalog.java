@@ -41,7 +41,7 @@ public final class AppCatalog {
             try{
                 PackageManager pm=c.getPackageManager();Intent intent=new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER).setComponent(component).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
                 ResolveInfo ri=pm.resolveActivity(intent,0);
-                if(ri!=null && ri.activityInfo.exported){String label=ri.loadLabel(pm).toString();Drawable drawable=ri.loadIcon(pm);Bitmap icon=Bitmap.createBitmap(144,144,Bitmap.Config.ARGB_8888);drawable.setBounds(0,0,144,144);drawable.draw(new Canvas(icon));String type=ri.activityInfo.applicationInfo.category==android.content.pm.ApplicationInfo.CATEGORY_VIDEO?"视频":category(component.getPackageName(),label);result=new App(component.getPackageName(),label,type,intent,icon,taskId,displayId);}
+                if(ri!=null && ri.activityInfo.exported){String label=ri.loadLabel(pm).toString();Drawable drawable=ri.loadIcon(pm);Bitmap icon=Bitmap.createBitmap(144,144,Bitmap.Config.ARGB_8888);drawable.setBounds(0,0,144,144);drawable.draw(new Canvas(icon));String type=category(ri.activityInfo.applicationInfo,component.getPackageName(),label);result=new App(component.getPackageName(),label,type,intent,icon,taskId,displayId);}
             }catch(RuntimeException ignored){}
             App resolved=result;MAIN.post(()->callback.loaded(resolved));
         });
@@ -62,9 +62,8 @@ public final class AppCatalog {
                 if (pkg.equals(appContext.getPackageName()) || !seen.add(pkg)) continue;
                 try {
                     String label = ri.loadLabel(pm).toString();
-                    String appCategory=category(pkg,label);
-                    if(ri.activityInfo.applicationInfo.category==android.content.pm.ApplicationInfo.CATEGORY_VIDEO)appCategory="视频";
-                    if(!appCategory.equals("视频"))continue;
+                    String appCategory=category(ri.activityInfo.applicationInfo,pkg,label);
+                    if(!appCategory.equals("视频") && !appCategory.equals("游戏"))continue;
                     Drawable drawable = ri.loadIcon(pm);
                     Bitmap icon = Bitmap.createBitmap(144, 144, Bitmap.Config.ARGB_8888);
                     drawable.setBounds(0, 0, 144, 144); drawable.draw(new Canvas(icon));
@@ -78,14 +77,12 @@ public final class AppCatalog {
             MAIN.post(() -> { cached = result; callback.loaded(new ArrayList<>(result)); });
         });
     }
-    private static String category(String pkg, String label) {
-        String text = (pkg + " " + label).toLowerCase(Locale.ROOT);
-        if (text.matches(".*(aweme|bilibili|kuaishou|qiyi|youku|hunantv|视频|抖音|哔哩|快手|优酷|爱奇艺|芒果).*")) return "视频";
-        if (text.matches(".*(music|cloudmusic|音乐|酷狗|酷我|汽水).*")) return "音乐";
-        return "工具";
+    private static String category(android.content.pm.ApplicationInfo info,String pkg,String label) {
+        boolean game=info.category==android.content.pm.ApplicationInfo.CATEGORY_GAME || (info.flags&android.content.pm.ApplicationInfo.FLAG_IS_GAME)!=0;
+        return WorkspacePolicy.category(pkg,label,info.category==android.content.pm.ApplicationInfo.CATEGORY_VIDEO,game);
     }
     public static long lastUsed(Context c, App app) { return prefs(c).getLong("recent." + app.packageName, 0); }
-    public static void record(Context c, App app) { prefs(c).edit().putLong("recent." + app.packageName, System.currentTimeMillis()).apply(); }
+    public static void record(Context c, App app) { prefs(c).edit().putLong("recent." + app.packageName, System.currentTimeMillis()).putString("paired."+app.category,app.packageName).apply(); }
     public static List<App> featured(Context c, List<App> apps) {
         List<App> sorted = new ArrayList<>(apps);
         Collections.sort(sorted, (a,b) -> Long.compare(score(c,b), score(c,a)));
